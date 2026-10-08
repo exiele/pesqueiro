@@ -43,7 +43,7 @@ Cursor templates and debug output are stored in `~/.local/share/pesqueiro/` (set
 ### From source
 
 ```sh
-git clone <repository-url> pesqueiro
+git clone [<repository-url> pesqueiro](https://github.com/exiele/pesqueiro)
 cd pesqueiro
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[gui,move]'
