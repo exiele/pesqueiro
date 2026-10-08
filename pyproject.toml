@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pesqueiro"
+version = "0.1.0"
+description = "Linux-first World of Warcraft fishing automation"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.0", "dbus-next>=0.2.3", "numpy>=1.26"]
+
+[project.scripts]
+pesqueiro = "pesqueiro.cli:main"
+pesqueiro-gui = "pesqueiro.gui:main"
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.7"]
+move = ["evdev>=1.7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

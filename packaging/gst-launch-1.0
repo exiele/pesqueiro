@@ -1,0 +1,23 @@
+#!/bin/sh
+ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")/lib/gst"
+
+REQUIRED="$(cat "$ROOT/glibc-min")"
+SYSTEM="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+if [ "$(printf '%s\n%s\n' "$REQUIRED" "$SYSTEM" | sort -V | head -n1)" != "$REQUIRED" ]; then
+    BUNDLE_BIN="$(dirname "$(readlink -f "$0")")"
+    echo "bundled GStreamer needs glibc $REQUIRED (found $SYSTEM); using the system gst-launch-1.0" >&2
+    PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$BUNDLE_BIN" | paste -sd:)"
+    exec gst-launch-1.0 "$@"
+fi
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pesqueiro"
+mkdir -p "$CACHE"
+
+export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GST_PLUGIN_SYSTEM_PATH_1_0="$ROOT/plugins"
+export GST_PLUGIN_PATH_1_0="$ROOT/plugins"
+export GST_REGISTRY_1_0="$CACHE/gst-registry.bin"
+export GST_REGISTRY_FORK=no
+export SPA_PLUGIN_DIR="$ROOT/spa-0.2"
+export PIPEWIRE_MODULE_DIR="$ROOT/pipewire-0.3"
+
+exec "$ROOT/bin/gst-launch-1.0" "$@"

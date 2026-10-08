@@ -1,0 +1,14 @@
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="$HERE"
+export PATH="$HERE/usr/bin:$PATH"
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+
+PYTHON="$HERE/opt/python3.12/bin/python3.12"
+
+if [ "${1:-}" = "cli" ]; then
+    shift
+    exec "$PYTHON" -m pesqueiro "$@"
+fi
+exec "$PYTHON" -m pesqueiro.gui "$@"

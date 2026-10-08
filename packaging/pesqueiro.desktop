@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Pesqueiro
+Comment=Fishing automation for World of Warcraft on Wayland
+Exec=AppRun
+Icon=pesqueiro
+Categories=Game;Utility;
+Terminal=false

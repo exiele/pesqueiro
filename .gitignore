@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+cursors/*.png
+cursors/*.jpg
+cursors/*.gif
+cursors/*.bmp
+cursors/*.tiff
+cursors/*.svg
+cursors/*.ico
+debug/
+cursors/*.webp
+build/
+dist/
