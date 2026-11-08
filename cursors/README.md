@@ -1,3 +1,3 @@
 # Cursor templates
 
-Images in this folder are used to recognise the game cursor. See the main README for details.
+Optional images in this folder are used alongside the embedded cursor templates. See the main README for details.

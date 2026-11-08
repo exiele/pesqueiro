@@ -17,6 +17,7 @@ def build_path(
     end: tuple[float, float],
     rng: random.Random | None = None,
     overshoot: bool = True,
+    duration_scale: float = 1.0,
 ) -> list[Step]:
     rng = rng or random.Random()
     distance = math.dist(start, end)
@@ -27,8 +28,10 @@ def build_path(
         ux, uy = (end[0] - start[0]) / distance, (end[1] - start[1]) / distance
         extra = rng.uniform(4, 14)
         aim = (end[0] + ux * extra, end[1] + uy * extra)
-        return _leg(start, aim, rng) + _leg(aim, end, rng, fast=False)
-    return _leg(start, end, rng)
+        return _leg(start, aim, rng, duration_scale=duration_scale) + _leg(
+            aim, end, rng, fast=False, duration_scale=duration_scale
+        )
+    return _leg(start, end, rng, duration_scale=duration_scale)
 
 
 def _leg(
@@ -36,6 +39,7 @@ def _leg(
     end: tuple[float, float],
     rng: random.Random,
     fast: bool = True,
+    duration_scale: float = 1.0,
 ) -> list[Step]:
     distance = math.dist(start, end)
     if distance < 1:
@@ -50,7 +54,11 @@ def _leg(
         )
 
     p1, p2 = control(rng.uniform(0.2, 0.4)), control(rng.uniform(0.6, 0.8))
-    duration = (0.25 + distance / 1800) * rng.uniform(0.8, 1.3) if fast else rng.uniform(0.08, 0.18)
+    duration = (
+        (0.25 + distance / 1800) * rng.uniform(0.8, 1.3)
+        if fast
+        else rng.uniform(0.08, 0.18)
+    ) * duration_scale
     count = max(6, int(duration * 90))
 
     steps: list[Step] = []

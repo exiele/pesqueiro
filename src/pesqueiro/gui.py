@@ -13,7 +13,7 @@ from datetime import datetime
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -37,7 +37,7 @@ from .cursor import (
     CursorTemplate,
     blank_cursor,
     find_cursor,
-    load_cursor_templates,
+    load_available_cursor_templates,
 )
 from .fisher import Fisher, State
 from .mouse import LatestReading, MouseError, UInputDevice
@@ -49,6 +49,10 @@ _CHANGE_THRESHOLD = 60
 _REAL_CURSOR_THRESHOLD = 20.0
 _CURSOR_JUMP = 250
 _SCALE_UNLOCK_MISSES = 12
+_BOBBER_REACQUIRE_MISSES = 4
+_BOBBER_ACQUIRE_MIN_SCORE = 12
+_DETECTION_INTERVAL = 0.05
+_PREVIEW_INTERVAL = 0.1
 
 
 def _to_qimage(image: Image.Image) -> QImage:
@@ -63,8 +67,40 @@ def _to_qimage(image: Image.Image) -> QImage:
     ).copy()
 
 
+class KeyCaptureEdit(QLineEdit):
+    """Records the physical key pressed instead of typed text."""
+
+    def __init__(self, default: str = "F12") -> None:
+        super().__init__(default)
+        self._default = default
+        self._code: int | None = None
+        self.setReadOnly(True)
+        self.setToolTip("Clique e pressione a tecla desejada")
+
+    def value(self) -> str:
+        return f"code:{self._code}" if self._code is not None else self._default
+
+    def keyPressEvent(self, event) -> None:
+        code = event.nativeScanCode() - 8  # xkb keycodes are evdev codes + 8
+        if code <= 0:
+            return
+        self._code = code
+        self.setText(QKeySequence(event.key()).toString() or f"tecla {code}")
+
+
 def _threshold_for(match) -> float:
     return _REAL_CURSOR_THRESHOLD if match.template.startswith("real_") else _CURSOR_THRESHOLD
+
+
+def _is_bobber_cursor(match) -> bool:
+    return match is not None and "cog" in match.template.lower()
+
+
+def _next_bobber_search(previous, current, misses: int):
+    if current is not None:
+        return current, 0
+    misses += 1
+    return (previous if misses <= _BOBBER_REACQUIRE_MISSES else None), misses
 
 
 def _central_region(size: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -78,6 +114,17 @@ def _changed_only(current: Image.Image, baseline: Image.Image) -> Image.Image:
     before = np.asarray(baseline.convert("RGB"), dtype=np.int16)
     changed = np.abs(now - before).sum(axis=2) > _CHANGE_THRESHOLD
     return Image.fromarray(np.where(changed[:, :, None], now, 0).astype(np.uint8))
+
+
+def _find_bobber_for_scan(image, classifier, previous, baseline, fishing, state, cursor_match, offset):
+    if fishing and state in (State.IDLE, State.CASTING):
+        return None
+    if fishing and previous is None and baseline is not None:
+        image = _changed_only(image, baseline)
+    match = find_bobber(blank_cursor(image, cursor_match, offset), classifier, previous)
+    if fishing and previous is None and match is not None and match.score < _BOBBER_ACQUIRE_MIN_SCORE:
+        return None
+    return match
 
 
 def _compose_preview(
@@ -116,6 +163,8 @@ def _compose_preview(
 
 
 class PreviewCanvas(QLabel):
+    position_selected = Signal(float, float)
+
     def __init__(self) -> None:
         super().__init__("Aguardando captura")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -135,6 +184,15 @@ class PreviewCanvas(QLabel):
         super().resizeEvent(event)
         self._fit_frame()
 
+    def mousePressEvent(self, event) -> None:
+        pixmap = self.pixmap()
+        if pixmap is not None and not pixmap.isNull() and event.button() == Qt.MouseButton.LeftButton:
+            x = event.position().x() - (self.width() - pixmap.width()) / 2
+            y = event.position().y() - (self.height() - pixmap.height()) / 2
+            if 0 <= x < pixmap.width() and 0 <= y < pixmap.height():
+                self.position_selected.emit(x / pixmap.width(), y / pixmap.height())
+        super().mousePressEvent(event)
+
     def _fit_frame(self) -> None:
         if self._frame is None or self.width() <= 0 or self.height() <= 0:
             return
@@ -151,17 +209,23 @@ class CaptureWorker(QThread):
     status_changed = Signal(str)
     failed = Signal(str)
     log_message = Signal(str)
+    fishing_availability = Signal(bool, str)
 
     def __init__(
         self,
         mode: ClassifierMode,
         templates: list[CursorTemplate] | None = None,
         auto_move: bool = True,
-        cast_key: str = "4",
+        cast_key: str = "F12",
+        lure_key: str = "F11",
     ) -> None:
         super().__init__()
         self._templates = templates or []
         self._cast_key = cast_key
+        self._lure_key = lure_key
+        self._rod_position: tuple[float, float] | None = None
+        self._frame_origin = (0, 0)
+        self._frame_size = (0, 0)
         self._locked_scale: float | None = None
         self.latest_image: Image.Image | None = None
         self.trace: deque = deque(maxlen=900)
@@ -215,7 +279,9 @@ class CaptureWorker(QThread):
             cursor_slot = LatestReading()
             mover = self._create_mover(cursor_slot)
             next_scan = 0.0
+            next_preview = 0.0
             previous_position = None
+            bobber_misses = 0
             bobber_position = None
             cursor_position = None
             cursor_seen: bool | None = None
@@ -223,67 +289,88 @@ class CaptureWorker(QThread):
             baseline: Image.Image | None = None
             last_known: tuple[int, int] | None = None
             pending: tuple[int, int] | None = None
+            cursor_match = None
+            cursor_task: asyncio.Task | None = None
+            searched = frame_at_launch = None
             while not self._stop_event.is_set():
                 frame = await capture.capture()
                 self.latest_image = frame.image
+                self._frame_origin = frame.origin
+                self._frame_size = frame.image.size
                 region = _central_region(frame.image.size)
                 now = time.monotonic()
                 if now >= next_scan:
                     left, top, right, bottom = region
                     scan_image = frame.image.crop((left, top, right, bottom))
                     fishing = mover is not None and self._auto_move.is_set()
-                    if fishing and mover.state is State.IDLE:
-                        baseline = scan_image
+                    if fishing and mover.state in (State.IDLE, State.CASTING):
+                        if mover.state is State.IDLE:
+                            baseline = scan_image
                         previous_position = None
-                    detect_image = scan_image
-                    if fishing and mover.state is not State.IDLE and baseline is not None:
-                        detect_image = _changed_only(scan_image, baseline)
-
-                    cursor_match = await asyncio.to_thread(
-                        self._locate_cursor, frame.image, cursor_position
-                    )
-                    if cursor_match is not None and cursor_match.score > _threshold_for(cursor_match):
-                        if self._templates and now >= next_report:
-                            self.log_message.emit(
-                                f"Closest cursor candidate: {cursor_match.template} "
-                                f"score {cursor_match.score:.0f} (needs <= {_CURSOR_THRESHOLD:.0f})"
-                            )
-                            next_report = now + 5
-                        cursor_match = None
-                    if cursor_match is not None:
-                        if last_known is not None and math.dist(cursor_match.position, last_known) > _CURSOR_JUMP:
-                            earlier, pending = pending, cursor_match.position
-                            if earlier is None or math.dist(earlier, cursor_match.position) > 20:
-                                cursor_match = None
-                        else:
-                            pending = None
-                    if cursor_match is not None:
-                        last_known = cursor_match.position
-                    cursor_position = cursor_match.position if cursor_match is not None else None
-                    cursor_slot.set(
-                        None
-                        if cursor_position is None
-                        else (frame.origin[0] + cursor_position[0], frame.origin[1] + cursor_position[1]),
-                        frame.captured_at,
-                    )
-                    if (cursor_position is not None) != cursor_seen and self._templates:
-                        cursor_seen = cursor_position is not None
-                        self.log_message.emit("Cursor found" if cursor_seen else "Cursor lost")
+                        bobber_misses = 0
+                    elif not fishing:
+                        previous_position = None
+                        bobber_misses = 0
+                    if cursor_task is not None and cursor_task.done():
+                        cursor_match = cursor_task.result()
+                        searched, cursor_task = frame_at_launch, None
+                        if cursor_match is not None and cursor_match.score > _threshold_for(cursor_match):
+                            if self._templates and now >= next_report:
+                                self.log_message.emit(
+                                    f"Closest cursor candidate: {cursor_match.template} "
+                                    f"score {cursor_match.score:.0f} (needs <= {_CURSOR_THRESHOLD:.0f})"
+                                )
+                                next_report = now + 5
+                            cursor_match = None
+                        if cursor_match is not None:
+                            if last_known is not None and math.dist(cursor_match.position, last_known) > _CURSOR_JUMP:
+                                earlier, pending = pending, cursor_match.position
+                                if earlier is None or math.dist(earlier, cursor_match.position) > 20:
+                                    cursor_match = None
+                            else:
+                                pending = None
+                        if cursor_match is not None:
+                            last_known = cursor_match.position
+                        cursor_position = cursor_match.position if cursor_match is not None else None
+                        cursor_slot.set(
+                            None
+                            if cursor_position is None
+                            else (searched.origin[0] + cursor_position[0], searched.origin[1] + cursor_position[1]),
+                            searched.captured_at,
+                        )
+                        if (cursor_position is not None) != cursor_seen and self._templates:
+                            cursor_seen = cursor_position is not None
+                            self.log_message.emit("Cursor found" if cursor_seen else "Cursor lost")
+                    if cursor_task is None:
+                        frame_at_launch = frame
+                        cursor_task = asyncio.ensure_future(
+                            asyncio.to_thread(self._locate_cursor, frame.image, cursor_position)
+                        )
 
                     match = await asyncio.to_thread(
-                        find_bobber,
-                        blank_cursor(detect_image, cursor_match, (left, top)),
+                        _find_bobber_for_scan,
+                        scan_image,
                         self.classifier,
                         previous_position,
+                        baseline,
+                        fishing,
+                        mover.state if mover is not None else State.IDLE,
+                        cursor_match,
+                        (left, top),
                     )
                     bobber_position = match.position if match is not None else None
-                    previous_position = bobber_position
+                    cursor_on_bobber = _is_bobber_cursor(cursor_match)
+                    previous_position, bobber_misses = _next_bobber_search(
+                        previous_position, bobber_position, bobber_misses
+                    )
                     self.trace.append(
                         (
                             round(now, 2),
                             mover.state.value if mover is not None else "-",
                             None if match is None else (*match.position, match.matching_pixels),
                             cursor_position,
+                            None if cursor_match is None else (cursor_match.template, round(cursor_match.score, 2)),
+                            round(frame.captured_at, 2),
                         )
                     )
                     if mover is not None:
@@ -295,22 +382,28 @@ class CaptureWorker(QThread):
                                     frame.origin[0] + region[0] + bobber_position[0],
                                     frame.origin[1] + region[1] + bobber_position[1],
                                 )
-                            mover.update(bobber_screen, None if match is None else match.matching_pixels)
+                            mover.update(
+                                bobber_screen,
+                                None if match is None else match.matching_pixels,
+                                cursor_on_bobber,
+                            )
                         else:
                             mover.cancel()
-                    next_scan = now + 0.25
+                    next_scan = now + _DETECTION_INTERVAL
 
-                preview = _compose_preview(
-                    frame.image, region, bobber_position, cursor_position
-                )
-                self.frame_ready.emit(
-                    preview,
-                    frame.origin,
-                    frame.image.size,
-                    bobber_position,
-                    region,
-                    cursor_position,
-                )
+                if now >= next_preview:
+                    preview = _compose_preview(
+                        frame.image, region, bobber_position, cursor_position
+                    )
+                    self.frame_ready.emit(
+                        preview,
+                        frame.origin,
+                        frame.image.size,
+                        bobber_position,
+                        region,
+                        cursor_position,
+                    )
+                    next_preview = now + _PREVIEW_INTERVAL
         finally:
             if mover is not None:
                 mover.cancel()
@@ -322,19 +415,49 @@ class CaptureWorker(QThread):
     def _create_mover(self, cursor_slot: LatestReading) -> Fisher | None:
         self._device = None
         if not self._templates:
+            self.fishing_availability.emit(False, f"Adicione imagens do cursor em {DEFAULT_CURSOR_DIR}")
             return None
         try:
-            self._device = UInputDevice([self._cast_key])
+            self._device = UInputDevice([self._cast_key, self._lure_key])
         except MouseError as error:
             self.log_message.emit(f"Auto-fishing unavailable: {error}")
+            self.fishing_availability.emit(False, f"Entrada indisponível: {error}")
             return None
-        return Fisher(self._device, cursor_slot, self.log_message.emit, self._cast_key, start_delay=0.0)
+        mover = Fisher(
+            self._device, cursor_slot, self.log_message.emit, self._cast_key,
+            start_delay=0.0, lure_key=self._lure_key, rod_position=self._rod_screen_position,
+        )
+        self.fishing_availability.emit(True, "Pronto para pescar")
+        return mover
+
+    def _rod_screen_position(self) -> tuple[int, int] | None:
+        if self._rod_position is None:
+            return None
+        return (
+            self._frame_origin[0] + round(self._rod_position[0] * self._frame_size[0]),
+            self._frame_origin[1] + round(self._rod_position[1] * self._frame_size[1]),
+        )
 
     def _locate_cursor(self, image: Image.Image, previous: tuple[int, int] | None):
         templates = self._templates
         if self._locked_scale is not None:
             templates = [t for t in templates if t.scale == self._locked_scale]
         match = self._search_cursor(image, templates, previous)
+        if (
+            self._locked_scale is not None
+            and (
+                match is None
+                or match.score > _threshold_for(match)
+            )
+        ):
+            alternate_templates = [t for t in self._templates if t.scale != self._locked_scale]
+            alternate = self._search_cursor(image, alternate_templates, previous) if alternate_templates else None
+            if (
+                alternate is not None
+                and alternate.score <= _threshold_for(alternate)
+                and (match is None or alternate.score < match.score)
+            ):
+                match = alternate
         if match is not None and match.score <= _threshold_for(match):
             if self._locked_scale != match.scale:
                 self._locked_scale = match.scale
@@ -359,6 +482,10 @@ class CaptureWorker(QThread):
             match = find_cursor(image, templates, region, threshold=None)
             if match is not None and match.score <= _threshold_for(match):
                 return match
+        region = _central_region(image.size)
+        match = find_cursor(image, templates, region, threshold=None)
+        if match is not None and match.score <= _threshold_for(match):
+            return match
         return find_cursor(image, templates, threshold=None)
 
 
@@ -397,6 +524,7 @@ class MainWindow(QMainWindow):
         preview_header.addWidget(self.frame_label)
         preview_column.addLayout(preview_header)
         self.preview = PreviewCanvas()
+        self.preview.position_selected.connect(self._select_rod_position)
         preview_column.addWidget(self.preview, 1)
         self.coordinate_label = QLabel("BOIA  --")
         self.coordinate_label.setObjectName("readout")
@@ -408,31 +536,46 @@ class MainWindow(QMainWindow):
 
         controls = QFrame()
         controls.setObjectName("panel")
-        controls_layout = QHBoxLayout(controls)
-        controls_layout.setContentsMargins(14, 10, 14, 10)
+        controls_panel_layout = QVBoxLayout(controls)
+        controls_panel_layout.setContentsMargins(14, 10, 14, 10)
+        controls_panel_layout.setSpacing(8)
+        controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
+        controls_panel_layout.addLayout(controls_layout)
 
         self.mode_box = QComboBox()
         self.mode_box.addItem("Vermelha", ClassifierMode.RED)
         self.mode_box.addItem("Azul", ClassifierMode.BLUE)
         self.mode_box.setMinimumWidth(90)
-        self.cast_key_box = QLineEdit("4")
-        self.cast_key_box.setMaxLength(4)
-        self.cast_key_box.setFixedWidth(60)
+        self.cast_key_box = KeyCaptureEdit()
+        self.cast_key_box.setFixedWidth(90)
+        self.lure_key_box = KeyCaptureEdit("F11")
+        self.lure_key_box.setFixedWidth(90)
         controls_layout.addLayout(self._labelled("PENA", self.mode_box))
         controls_layout.addLayout(self._labelled("TECLA DE LANÇAMENTO", self.cast_key_box))
+        controls_layout.addLayout(self._labelled("TECLA DE ISCA", self.lure_key_box))
+        self.rod_button = QPushButton("Selecionar vara")
+        self.rod_button.setCheckable(True)
+        self.rod_button.setEnabled(False)
+        self.rod_button.setToolTip("Selecione a vara na barra de ações pela prévia")
+        self.rod_button.toggled.connect(self._rod_selection_changed)
+        controls_layout.addWidget(self.rod_button)
         controls_layout.addStretch(1)
+
+        actions_layout = QHBoxLayout()
+        actions_layout.addStretch(1)
+        controls_panel_layout.addLayout(actions_layout)
 
         self.snapshot_button = QPushButton("Save snapshot")
         self.snapshot_button.setObjectName("ghostButton")
         self.snapshot_button.setToolTip("Save the current raw frame to the debug folder")
         self.snapshot_button.clicked.connect(self._save_snapshot)
-        controls_layout.addWidget(self.snapshot_button)
+        actions_layout.addWidget(self.snapshot_button)
         self.trace_button = QPushButton("Save scan trace")
         self.trace_button.setObjectName("ghostButton")
         self.trace_button.setToolTip("Write the last minutes of bobber and cursor readings to the debug folder")
         self.trace_button.clicked.connect(self._save_trace)
-        controls_layout.addWidget(self.trace_button)
+        actions_layout.addWidget(self.trace_button)
         self.snapshot_button.setVisible(self._debug)
         self.trace_button.setVisible(self._debug)
 
@@ -440,13 +583,17 @@ class MainWindow(QMainWindow):
         self.start_button.setObjectName("primaryButton")
         self.start_button.setMinimumWidth(190)
         self.start_button.clicked.connect(self._toggle_capture)
-        controls_layout.addWidget(self.start_button)
+        actions_layout.addWidget(self.start_button)
         self.fish_button = QPushButton("Iniciar pesca")
         self.fish_button.setObjectName("primaryButton")
         self.fish_button.setMinimumWidth(150)
         self.fish_button.setEnabled(False)
         self.fish_button.clicked.connect(self._toggle_fishing)
-        controls_layout.addWidget(self.fish_button)
+        actions_layout.addWidget(self.fish_button)
+        self.fishing_status = QLabel("Inicie a captura de tela")
+        self.fishing_status.setWordWrap(True)
+        self.fishing_status.setObjectName("muted")
+        controls_panel_layout.addWidget(self.fishing_status)
         self._fishing = False
         self._countdown = 0
         self._countdown_timer = QTimer(self)
@@ -544,22 +691,47 @@ class MainWindow(QMainWindow):
             return
         self._worker = CaptureWorker(
             self.mode_box.currentData(),
-            load_cursor_templates(scales=DEFAULT_SCALES),
+            load_available_cursor_templates(scales=DEFAULT_SCALES),
             False,
-            self.cast_key_box.text().strip() or "4",
+            self.cast_key_box.value(),
+            self.lure_key_box.value(),
         )
         self._worker.frame_ready.connect(self._show_frame)
         self._worker.log_message.connect(self._append_log)
         self._worker.status_changed.connect(self._set_status)
         self._worker.failed.connect(self._capture_failed)
+        self._worker.fishing_availability.connect(self._set_fishing_availability)
         self._worker.finished.connect(self._capture_finished)
         self._set_running(self.start_button, True, "Parar captura de tela")
-        self.fish_button.setEnabled(True)
+        self.fish_button.setEnabled(False)
+        self.fishing_status.setText("Aguardando captura de tela")
+        self.rod_button.setEnabled(True)
+        self.rod_button.setText("Selecionar vara")
+        self.rod_button.setChecked(False)
         self.mode_box.setEnabled(False)
         self.cast_key_box.setEnabled(False)
+        self.lure_key_box.setEnabled(False)
         self._set_status("STARTING")
         self._append_log("Screen capture requested; waiting for portal permission")
         self._worker.start()
+
+    def _select_rod_position(self, x: float, y: float) -> None:
+        if not self.rod_button.isChecked() or self._worker is None:
+            return
+        self._worker._rod_position = (x, y)
+        self.rod_button.setChecked(False)
+        self.rod_button.setText("Vara selecionada")
+        self._append_log("Fishing rod action selected")
+
+    def _set_fishing_availability(self, available: bool, message: str) -> None:
+        self.fish_button.setEnabled(available)
+        self.fishing_status.setText(message)
+
+    def _rod_selection_changed(self, selecting: bool) -> None:
+        selected = self._worker is not None and self._worker._rod_position is not None
+        self.rod_button.setText(
+            "Clique na vara na prévia" if selecting else "Vara selecionada" if selected else "Selecionar vara"
+        )
 
     def _save_snapshot(self) -> None:
         if self._worker is None or self._worker.latest_image is None:
@@ -590,8 +762,11 @@ class MainWindow(QMainWindow):
         folder = DATA_DIR / "debug"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"trace-{datetime.now():%H%M%S}.txt"
-        lines = ["time state bobber(x,y,red_pixels) cursor"]
-        lines += [f"{t} {state} {bobber} {cursor}" for t, state, bobber, cursor in list(self._worker.trace)]
+        lines = ["time state bobber(x,y,matching_pixels) cursor cursor_template(score) frame_time"]
+        lines += [
+            f"{t} {state} {bobber} {cursor} {cursor_match} {frame_time}"
+            for t, state, bobber, cursor, cursor_match, frame_time in list(self._worker.trace)
+        ]
         path.write_text("\n".join(lines) + "\n")
         self._append_log(f"Saved {path} ({len(lines) - 1} scans)")
 
@@ -662,6 +837,8 @@ class MainWindow(QMainWindow):
 
     def _capture_failed(self, message: str) -> None:
         self._set_status("CAPTURE ERROR")
+        detail = message.rstrip().splitlines()[-1] if message.strip() else "erro desconhecido"
+        self.fishing_status.setText(f"Falha na captura: {detail}")
         self._append_log(f"ERROR\n{message}")
 
     def _capture_finished(self) -> None:
@@ -670,9 +847,14 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self._set_running(self.start_button, False, "Iniciar captura de tela")
         self.fish_button.setEnabled(False)
+        if self._status != "CAPTURE ERROR":
+            self.fishing_status.setText("Inicie a captura de tela")
         self._set_running(self.fish_button, False, "Iniciar pesca")
         self.mode_box.setEnabled(True)
         self.cast_key_box.setEnabled(True)
+        self.lure_key_box.setEnabled(True)
+        self.rod_button.setEnabled(False)
+        self.rod_button.setChecked(False)
         if self._status not in {"CAPTURE ERROR", "OFFLINE"}:
             self._set_status("OFFLINE")
 

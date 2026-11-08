@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+from base64 import b64decode
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,7 @@ DEFAULT_CURSOR_DIR = DATA_DIR / "cursors"
 DEFAULT_SCALES = (1.0, 1.5, 2.0, 0.75)
 _HOTSPOT = re.compile(r"@(\d+),(\d+)$")
 _COARSE_SCALE = 4
+_LARGE_FRAME_COARSE_SCALE = 8
 _COARSE_CANDIDATES = 3
 _COARSE_MAX_PIXELS = 24
 _FINE_MAX_PIXELS = 160
@@ -89,17 +92,44 @@ def _make_template(
 def load_cursor_templates(
     folder: Path | str = DEFAULT_CURSOR_DIR, scales: tuple[float, ...] = (1.0,)
 ) -> list[CursorTemplate]:
-    templates: list[CursorTemplate] = []
     folder = Path(folder)
     if not folder.is_dir():
-        return templates
-    seen: set[bytes] = set()
+        return []
     paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in _EXTENSIONS)
+    images = []
     for path in paths:
         match = _HOTSPOT.search(path.stem)
         hotspot = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
         with Image.open(path) as source:
-            base = source.convert("RGBA")
+            images.append((path.stem, source.convert("RGBA"), hotspot))
+    return _load_template_images(images, scales)
+
+
+def load_builtin_cursor_templates(scales: tuple[float, ...] = (1.0,)) -> list[CursorTemplate]:
+    from ._cursor_images import CURSOR_IMAGES
+
+    images = []
+    for name, hotspot, data in CURSOR_IMAGES:
+        with Image.open(BytesIO(b64decode(data))) as source:
+            images.append((name, source.convert("RGBA"), hotspot))
+    return _load_template_images(images, scales)
+
+
+def load_available_cursor_templates(
+    folder: Path | str = DEFAULT_CURSOR_DIR, scales: tuple[float, ...] = (1.0,)
+) -> list[CursorTemplate]:
+    local = load_cursor_templates(folder, scales)
+    local_names = {template.name for template in local}
+    return local + [
+        template for template in load_builtin_cursor_templates(scales)
+        if template.name not in local_names
+    ]
+
+
+def _load_template_images(images, scales: tuple[float, ...]) -> list[CursorTemplate]:
+    templates: list[CursorTemplate] = []
+    seen: set[bytes] = set()
+    for name, base, hotspot in images:
         longest = max(base.size)
         if longest > _MAX_TEMPLATE_SIDE * 2:
             factor = 32 / longest
@@ -117,7 +147,7 @@ def load_cursor_templates(
                     Image.Resampling.LANCZOS,
                 )
                 scaled_hotspot = (round(hotspot[0] * scale), round(hotspot[1] * scale))
-            template = _make_template(path.stem, rgba, scaled_hotspot, scale)
+            template = _make_template(name, rgba, scaled_hotspot, scale)
             if template is None:
                 continue
             key = template.gray[template.mask].tobytes() + template.mask.tobytes()
@@ -156,9 +186,9 @@ def _zncc_map(
     return np.where(valid, numerator / denominator, -1.0).astype(np.float32)
 
 
-def _downscale(template: CursorTemplate) -> tuple[np.ndarray, np.ndarray] | None:
+def _downscale(template: CursorTemplate, scale: int) -> tuple[np.ndarray, np.ndarray] | None:
     height, width = template.mask.shape
-    small = (max(1, width // _COARSE_SCALE), max(1, height // _COARSE_SCALE))
+    small = (max(1, width // scale), max(1, height // scale))
     premultiplied = Image.fromarray((template.gray * template.mask).astype(np.uint8))
     coverage = Image.fromarray(template.mask.astype(np.uint8) * 255)
     weight = np.asarray(coverage.resize(small, Image.Resampling.BOX), dtype=np.float32) / 255
@@ -169,13 +199,17 @@ def _downscale(template: CursorTemplate) -> tuple[np.ndarray, np.ndarray] | None
 
 
 def _match_template(
-    frame: np.ndarray, small_frame: np.ndarray, template: CursorTemplate
+    frame: np.ndarray, small_frame: np.ndarray, template: CursorTemplate, coarse_scale: int
 ) -> tuple[float, tuple[int, int]] | None:
     height, width = template.mask.shape
     if frame.shape[0] < height or frame.shape[1] < width:
         return None
 
-    coarse = _downscale(template)
+    search_scale = coarse_scale
+    coarse = _downscale(template, search_scale)
+    if coarse is None and search_scale != _COARSE_SCALE:
+        search_scale = _COARSE_SCALE
+        coarse = _downscale(template, search_scale)
     if coarse is None:
         return None
     c_gray, c_mask = coarse
@@ -183,12 +217,12 @@ def _match_template(
         return None
     scores = _zncc_map(small_frame, c_gray, c_mask, _COARSE_MAX_PIXELS)
     picks = np.argpartition(-scores.ravel(), min(_COARSE_CANDIDATES, scores.size) - 1)
-    search = _COARSE_SCALE * 2
+    search = search_scale * 2
 
     best: tuple[float, tuple[int, int]] | None = None
     for index in picks[:_COARSE_CANDIDATES]:
-        cx = int(index % scores.shape[1]) * _COARSE_SCALE
-        cy = int(index // scores.shape[1]) * _COARSE_SCALE
+        cx = int(index % scores.shape[1]) * search_scale
+        cy = int(index // scores.shape[1]) * search_scale
         x0, y0 = max(0, cx - search), max(0, cy - search)
         x1 = min(frame.shape[1], cx + width + search)
         y1 = min(frame.shape[0], cy + height + search)
@@ -214,9 +248,14 @@ def find_cursor(
     left, top = (region[0], region[1]) if region else (0, 0)
     source = (image.crop(region) if region else image).convert("L")
     frame = np.asarray(source, dtype=np.float32)
+    coarse_scale = (
+        _LARGE_FRAME_COARSE_SCALE
+        if source.width >= 2560 or source.height >= 1440
+        else _COARSE_SCALE
+    )
     small_frame = np.asarray(
         source.resize(
-            (max(1, source.width // _COARSE_SCALE), max(1, source.height // _COARSE_SCALE)),
+            (max(1, source.width // coarse_scale), max(1, source.height // coarse_scale)),
             Image.Resampling.BOX,
         ),
         dtype=np.float32,
@@ -224,7 +263,7 @@ def find_cursor(
 
     best: CursorMatch | None = None
     for template in templates:
-        result = _match_template(frame, small_frame, template)
+        result = _match_template(frame, small_frame, template, coarse_scale)
         if result is None:
             continue
         score, (x, y) = result

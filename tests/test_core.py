@@ -49,11 +49,51 @@ class BobberFinderTests(unittest.TestCase):
         self.assertEqual(17, result.matching_pixels)
         self.assertEqual((310, 210), result.screen_position((300, 200)))
 
+    def test_targets_attached_float_instead_of_colored_marker(self):
+        image = Image.new("RGB", (100, 80), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((20, 20, 26, 26), fill=(255, 20, 20))
+        draw.rectangle((27, 27, 47, 53), fill=(130, 90, 50))
+
+        result = find_bobber(image, PixelClassifier())
+
+        self.assertIsNotNone(result)
+        self.assertEqual((37, 40), result.position)
+
     def test_previous_position_limits_search_area(self):
         image = Image.new("RGB", (100, 60), "black")
         ImageDraw.Draw(image).point((80, 30), fill=(255, 20, 20))
 
-        self.assertIsNone(find_bobber(image, PixelClassifier(), (10, 10)))
+        self.assertIsNone(find_bobber(image, PixelClassifier(), (10, 10), search_radius=40))
+
+    def test_tracks_marker_far_from_float_body(self):
+        image = Image.new("RGB", (200, 120), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((30, 30, 36, 36), fill=(255, 20, 20))
+        draw.rectangle((85, 37, 105, 63), fill=(130, 90, 50))
+
+        initial = find_bobber(image, PixelClassifier())
+        tracked = find_bobber(image, PixelClassifier(), initial.position)
+
+        self.assertEqual((93, 50), initial.position)
+        self.assertEqual(initial, tracked)
+
+    def test_tracked_float_body_can_extend_beyond_search_area(self):
+        image = Image.new("RGB", (150, 100), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((50, 20, 56, 26), fill=(255, 20, 20))
+        draw.rectangle((57, 27, 77, 53), fill=(130, 90, 50))
+
+        initial = find_bobber(image, PixelClassifier())
+        tracked = find_bobber(image, PixelClassifier(), (50, 20), search_radius=10)
+
+        self.assertEqual((67, 40), initial.position)
+        self.assertEqual(initial, tracked)
+
+    def test_previous_position_outside_image_returns_no_match(self):
+        image = Image.new("RGB", (20, 20), "black")
+
+        self.assertIsNone(find_bobber(image, PixelClassifier(), (200, 200)))
 
     def test_excess_matching_pixels_are_rejected(self):
         image = Image.new("RGB", (5, 5), (255, 20, 20))
@@ -61,6 +101,20 @@ class BobberFinderTests(unittest.TestCase):
         self.assertIsNone(
             find_bobber(image, PixelClassifier(), max_matching_pixels=10)
         )
+
+    def test_selects_bobber_cluster_when_background_has_over_thousand_matches(self):
+        image = Image.new("RGB", (900, 900), "black")
+        draw = ImageDraw.Draw(image)
+        for x in range(10, 730, 20):
+            for y in range(10, 730, 20):
+                draw.point((x, y), fill=(255, 20, 20))
+        draw.rectangle((820, 820, 823, 823), fill=(255, 20, 20))
+
+        result = find_bobber(image, PixelClassifier())
+
+        self.assertIsNotNone(result)
+        self.assertEqual((820, 820), result.position)
+        self.assertEqual(1312, result.matching_pixels)
 
 
 class BiteWatcherTests(unittest.TestCase):
@@ -70,7 +124,8 @@ class BiteWatcherTests(unittest.TestCase):
 
         for y_position in range(101, 107):
             self.assertFalse(watcher.is_bite((100, y_position)))
-        self.assertTrue(watcher.is_bite((100, 113)))
+        self.assertFalse(watcher.is_bite((100, 113)))
+        self.assertTrue(watcher.is_bite((100, 103)))
 
     def test_reset_discards_previous_observations(self):
         watcher = BiteWatcher(strike_value=7)
@@ -80,7 +135,31 @@ class BiteWatcherTests(unittest.TestCase):
 
         for y_position in range(51, 57):
             self.assertFalse(watcher.is_bite((100, y_position)))
-        self.assertTrue(watcher.is_bite((100, 63)))
+        self.assertFalse(watcher.is_bite((100, 63)))
+        self.assertTrue(watcher.is_bite((100, 53)))
+
+    def test_normal_jitter_does_not_trigger_a_bite(self):
+        watcher = BiteWatcher()
+        watcher.reset((100, 1083))
+
+        for position in (1089, 1083, 1086, 1081, 1089, 1083):
+            self.assertFalse(watcher.is_bite((100, position)))
+
+    def test_upward_bounce_triggers_a_bite(self):
+        watcher = BiteWatcher()
+        watcher.reset((100, 100))
+
+        self.assertFalse(watcher.is_bite((100, 87)))
+        self.assertTrue(watcher.is_bite((100, 98)))
+
+    def test_unfinished_excursion_rebases_and_detects_next_bounce(self):
+        watcher = BiteWatcher()
+        watcher.reset((100, 100))
+
+        for _ in range(20):
+            self.assertFalse(watcher.is_bite((100, 115)))
+        self.assertFalse(watcher.is_bite((100, 130)))
+        self.assertTrue(watcher.is_bite((100, 115)))
 
 
 class CommandLineTests(unittest.TestCase):

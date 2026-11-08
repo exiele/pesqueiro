@@ -6,7 +6,7 @@ Fishing automation for World of Warcraft on Linux (Wayland). Pesqueiro watches t
 
 1. Casts with a configurable key.
 2. Waits for the bobber to land, then parks the cursor next to it.
-3. Watches the bobber for a downward dip, a shrinking red area, or a bounce.
+3. Watches for a downward dip followed by a bounce back.
 4. Moves onto the bobber, right-clicks to loot, and casts again.
 
 Screen capture needs your permission through the desktop portal. Input is sent through a virtual device (`/dev/uinput`), so no X11 is required.
@@ -38,7 +38,7 @@ The bundled GStreamer is built against a recent glibc. On a distribution with an
 
 Run the command line tool with `./Pesqueiro-*-x86_64.AppImage cli --wayland --mode red`.
 
-Cursor templates and debug output are stored in `~/.local/share/pesqueiro/` (set `PESQUEIRO_HOME` to change it).
+Optional cursor templates and debug output are stored in `~/.local/share/pesqueiro/` (set `PESQUEIRO_HOME` to change it).
 
 ### From source
 
@@ -74,14 +74,14 @@ Without this access the preview and detection still work, but the bot cannot cas
 
 ## Cursor templates
 
-The game cursor is located by matching the images in `cursors/` (`~/.local/share/pesqueiro/cursors/` when using the AppImage). No images are shipped with the project: you must add crops of your own in-game cursors before auto-fishing works.
+The game cursor is located by template matching. Gauntlet and cog cursor images are embedded in the app, so no additional files are needed for those cursor appearances. Other appearances may require custom templates.
+
+Optional custom images can be placed in `cursors/` (`~/.local/share/pesqueiro/cursors/` when using the AppImage). A custom image with the same name as an embedded template replaces it.
 
 - Append the hotspot (the pixel that points at the target) as `@x,y`, for example `real_gauntlet@3,3.png`. Without a suffix the hotspot is the top-left corner.
 - Supported formats: PNG, WebP, GIF, BMP.
 
-Without any template, detection runs but auto-fishing is disabled.
-
-Template images are ignored by git, so they stay local to your machine.
+Custom template images are ignored by git, so they stay local to your machine.
 
 ## Use
 
@@ -89,10 +89,10 @@ Template images are ignored by git, so they stay local to your machine.
 .venv/bin/pesqueiro-gui
 ```
 
-1. Pick the bobber colour (**Vermelha** = red, **Azul** = blue, for lava) and the cast key (**Tecla de lançamento**, default `4`).
+1. Pick the bobber colour (**Vermelha** = red, **Azul** = blue, for lava), the cast key (**Tecla de lançamento**, default `F12`), and the lure key (**Tecla de isca**, default `F11`). Put the lure and fishing rod on the game's action bars.
 2. Click **Iniciar captura de tela** (start screen capture) and choose the game window or display in the desktop prompt.
-3. The preview shows the detection region (green frame), the bobber (orange crosshair) and the cursor (blue square).
-4. Click **Iniciar pesca** (start fishing). After a 3 second countdown, switch to the game window. Pesqueiro casts and fishes on its own.
+3. Optionally, click **Selecionar vara**, then click the fishing rod's action-bar button in the live preview to enable automatic lure application. Select it again if you move the button.
+4. Click **Iniciar pesca** (start fishing). After a 3 second countdown, switch to the game window. Pesqueiro casts and fishes on its own. If a rod is selected, every 8 to 10 minutes it waits for the current cast to finish, presses the lure key, clicks the rod, and allows at least 6 seconds for the lure to apply before casting again.
 5. Click **Parar pesca** to stop fishing and **Parar captura de tela** to end the capture.
 
 Keep the in-game cursor visible. The bobber is searched in the central half of the captured frame.
